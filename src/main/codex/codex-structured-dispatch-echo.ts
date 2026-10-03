@@ -1,5 +1,6 @@
 import type { ProviderDiagnostic } from '../../shared/agent-session-failure'
 import type { AgentJournalItemIdentity } from '../../shared/agent-session-journal-types'
+import type { CodexPromptBlock } from './codex-structured-prompt-block'
 
 /** Sends awaiting their echo. One bound to a turn that ended without taking it settles from that
  *  end; any other whose echo never arrives is retired by the journal's recovery on exit. */
@@ -8,9 +9,10 @@ export const MAX_CODEX_PENDING_DISPATCH_ECHOES = 256
  *  turns kept that Codex left unopened through a wait. */
 export const MAX_CODEX_RECORDED_TURN_ENDS = 64
 
-/** How a primary-thread turn ended, as Codex reported it. */
+/** How a primary-thread turn ended, as Codex reported it. `blocked`: a Codex hook blocked a prompt
+ *  in that turn, which Codex then never recorded. */
 export type CodexTurnEnd =
-  | { status: 'completed' }
+  | { status: 'completed'; blocked?: CodexPromptBlock }
   | { status: 'interrupted' }
   | { status: 'failed'; detail?: ProviderDiagnostic }
 
@@ -44,9 +46,15 @@ export type CodexDispatchEchoes = {
   answeredUnopenedTurn: (threadId: string, openTurnIds: ReadonlySet<string>) => string | null
   /** Codex did not open this answered turn within a wait, so no later wait is spent on it. */
   leftUnopened: (threadId: string, turnId: string) => void
+  /** Codex reported a Codex hook blocked a prompt in this turn, kept only until the turn ends: the
+   *  first reason any of its hooks gave. */
+  blockPrompt: (threadId: string, turnId: string, block: CodexPromptBlock) => void
+  /** The block reported in this turn, which its end takes; null when none was. */
+  takePromptBlock: (threadId: string, turnId: string) => CodexPromptBlock | null
   /**
    * Records a turn's end and returns the sends bound to it that it settles: all of them unless it
-   * completed, which echoes its pending input first, so one it never echoed waits for recovery. An
+   * completed, which echoes its pending input first, so one it never echoed waits for recovery,
+   * unless a hook blocked a prompt in it: Codex records nothing it blocked. An
    * interrupt withdraws an un-echoed send, steered or the turn's own input: neither reached history.
    */
   endTurn: (threadId: string, turnId: string, end: CodexTurnEnd) => string[]
@@ -65,9 +73,11 @@ export function createCodexDispatchEchoes(): CodexDispatchEchoes {
   >()
   const endedTurns = new Map<string, CodexTurnEnd>()
   const unopenedTurns = new Set<string>()
+  const blockedTurns = new Map<string, CodexPromptBlock>()
   let nextSequence = 0
   const turnKey = (threadId: string, turnId: string): string => JSON.stringify([threadId, turnId])
-  const settles = (end: CodexTurnEnd): boolean => end.status !== 'completed'
+  const settles = (end: CodexTurnEnd): boolean =>
+    end.status !== 'completed' || end.blocked !== undefined
   return {
     arm(clientMessageId, requestedAt) {
       const existing = armed.get(clientMessageId)
@@ -117,6 +127,25 @@ export function createCodexDispatchEchoes(): CodexDispatchEchoes {
         unopenedTurns.delete(oldest)
       }
     },
+    blockPrompt: (threadId, turnId, block) => {
+      const turn = turnKey(threadId, turnId)
+      // Codex reports hooks in their configured order and blocks for the first reason given.
+      const earlier = blockedTurns.get(turn)
+      blockedTurns.delete(turn)
+      blockedTurns.set(turn, earlier?.reason ? earlier : block)
+      for (const oldest of blockedTurns.keys()) {
+        if (blockedTurns.size <= MAX_CODEX_RECORDED_TURN_ENDS) {
+          break
+        }
+        blockedTurns.delete(oldest)
+      }
+    },
+    takePromptBlock: (threadId, turnId) => {
+      const turn = turnKey(threadId, turnId)
+      const block = blockedTurns.get(turn) ?? null
+      blockedTurns.delete(turn)
+      return block
+    },
     endTurn: (threadId, turnId, end) => {
       const turn = turnKey(threadId, turnId)
       endedTurns.delete(turn)
@@ -151,6 +180,7 @@ export function createCodexDispatchEchoes(): CodexDispatchEchoes {
       armed.clear()
       endedTurns.clear()
       unopenedTurns.clear()
+      blockedTurns.clear()
       nextSequence = 0
     },
     get size() {

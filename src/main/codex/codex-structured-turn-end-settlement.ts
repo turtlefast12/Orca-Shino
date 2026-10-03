@@ -4,8 +4,11 @@
 // or reaches only the model's context, and the thread history shows no user message either way.
 // So it is withdrawn, as a Stop's host-side withdrawal is. Any other end records pending
 // input before `turn/completed`, a failed turn after its `error` frame, so only that
-// frame settles: a failed turn that never echoed the send refused it, in Codex's words,
-// and a completed one leaves it pending for the journal's recovery on exit.
+// frame settles: a failed turn that never echoed the send refused it, in Codex's words. A
+// completed one settles it only when Codex reported a hook blocked a prompt in that turn
+// (codex-structured-prompt-block): Codex records nothing it blocked, so the send was not
+// delivered, for the hook's reason. Otherwise it stays pending for the journal's recovery on
+// exit.
 
 import {
   agentSessionFailureFact,
@@ -66,6 +69,10 @@ export function readCodexTurnEnd(method: string, params: unknown): CodexTurnEnd 
 
 /** How an ended turn settles a send it never echoed; null leaves the send to its echo. */
 export function codexTurnEndRejection(end: CodexTurnEnd): AgentJournalDispatchRejection | null {
+  if (end.status === 'completed' && end.blocked) {
+    const detail = end.blocked.reason ? providerDiagnostic(end.blocked.reason, 'person') : undefined
+    return codexDispatchRejection(agentSessionFailureFact('hookBlocked', detail ? { detail } : {}))
+  }
   if (end.status === 'interrupted') {
     return agentSessionFailureWords(agentSessionFailureFact('cancelled'), { surface: 'rejection' })
   }
@@ -85,10 +92,18 @@ export function settleCodexSendsInEndedTurn(
   settle: (settlement: CodexTurnEndSettlement) => void
 ): void {
   const turnId = readCodexTurnId(params)
-  const end = readCodexTurnEnd(method, params)
-  if (!turnId || !end || (readCodexThreadId(params) ?? session.threadId) !== session.threadId) {
+  const reported = readCodexTurnEnd(method, params)
+  if (
+    !turnId ||
+    !reported ||
+    (readCodexThreadId(params) ?? session.threadId) !== session.threadId
+  ) {
     return
   }
+  // Whatever the turn's end, a block it reported ends with it.
+  const blocked = session.dispatchEchoes.takePromptBlock(session.threadId, turnId)
+  const end: CodexTurnEnd =
+    reported.status === 'completed' && blocked ? { ...reported, blocked } : reported
   const rejection = codexTurnEndRejection(end)
   for (const clientMessageId of session.dispatchEchoes.endTurn(session.threadId, turnId, end)) {
     if (rejection) {
